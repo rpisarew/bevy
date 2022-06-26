@@ -1,13 +1,51 @@
 use crate::storage::SparseSetIndex;
 use bevy_utils::HashSet;
+use core::fmt;
 use fixedbitset::FixedBitSet;
 use std::marker::PhantomData;
+
+/// A wrapper struct to make Debug representations of [`FixedBitSet`] easier
+/// to read, when used to store [`SparseSetIndex`].
+///
+/// Instead of the raw integer representation of the `FixedBitSet`, the list of
+/// `T` valid for [`SparseSetIndex`] is shown.
+///
+/// Normal `FixedBitSet` `Debug` output:
+/// ```text
+/// read_and_writes: FixedBitSet { data : [ 160 ], length: 8 }
+/// ```
+///
+/// Which, unless you are a computer, doesn't help much understand what's in
+/// the set. With `FormattedBitSet`, we convert the present set entries into
+/// what they stand for, it is much clearer what is going on:
+/// ```text
+/// read_and_writes: [ ComponentId(5), ComponentId(7) ]
+/// ```
+struct FormattedBitSet<'a, T: SparseSetIndex> {
+    bit_set: &'a FixedBitSet,
+    _marker: PhantomData<T>,
+}
+impl<'a, T: SparseSetIndex> FormattedBitSet<'a, T> {
+    fn new(bit_set: &'a FixedBitSet) -> Self {
+        Self {
+            bit_set,
+            _marker: PhantomData,
+        }
+    }
+}
+impl<'a, T: SparseSetIndex + fmt::Debug> fmt::Debug for FormattedBitSet<'a, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list()
+            .entries(self.bit_set.ones().map(T::get_sparse_set_index))
+            .finish()
+    }
+}
 
 /// Tracks read and write access to specific elements in a collection.
 ///
 /// Used internally to ensure soundness during system initialization and execution.
 /// See the [`is_compatible`](Access::is_compatible) and [`get_conflicts`](Access::get_conflicts) functions.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct Access<T: SparseSetIndex> {
     /// All accessed elements.
     reads_and_writes: FixedBitSet,
@@ -19,6 +57,18 @@ pub struct Access<T: SparseSetIndex> {
     marker: PhantomData<T>,
 }
 
+impl<T: SparseSetIndex + fmt::Debug> fmt::Debug for Access<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Access")
+            .field(
+                "read_and_writes",
+                &FormattedBitSet::<T>::new(&self.reads_and_writes),
+            )
+            .field("writes", &FormattedBitSet::<T>::new(&self.writes))
+            .field("reads_all", &self.reads_all)
+            .finish()
+    }
+}
 impl<T: SparseSetIndex> Default for Access<T> {
     fn default() -> Self {
         Self {
@@ -55,11 +105,7 @@ impl<T: SparseSetIndex> Access<T> {
 
     /// Returns `true` if this can access the element given by `index`.
     pub fn has_read(&self, index: T) -> bool {
-        if self.reads_all {
-            true
-        } else {
-            self.reads_and_writes.contains(index.sparse_set_index())
-        }
+        self.reads_all || self.reads_and_writes.contains(index.sparse_set_index())
     }
 
     /// Returns `true` if this can exclusively access the element given by `index`.
@@ -98,15 +144,15 @@ impl<T: SparseSetIndex> Access<T> {
     pub fn is_compatible(&self, other: &Access<T>) -> bool {
         // Only systems that do not write data are compatible with systems that operate on `&World`.
         if self.reads_all {
-            return other.writes.count_ones(..) == 0;
+            return other.writes.is_empty();
         }
 
         if other.reads_all {
-            return self.writes.count_ones(..) == 0;
+            return self.writes.is_empty();
         }
 
         self.writes.is_disjoint(&other.reads_and_writes)
-            && self.reads_and_writes.is_disjoint(&other.writes)
+            && other.writes.is_disjoint(&self.reads_and_writes)
     }
 
     /// Returns a vector of elements that the access and `other` cannot access at the same time.
@@ -165,11 +211,20 @@ impl<T: SparseSetIndex> Access<T> {
 /// - `Query<Option<&T>` accesses nothing
 ///
 /// See comments the `WorldQuery` impls of `AnyOf`/`Option`/`Or` for more information.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct FilteredAccess<T: SparseSetIndex> {
     access: Access<T>,
     with: FixedBitSet,
     without: FixedBitSet,
+}
+impl<T: SparseSetIndex + fmt::Debug> fmt::Debug for FilteredAccess<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FilteredAccess")
+            .field("access", &self.access)
+            .field("with", &FormattedBitSet::<T>::new(&self.with))
+            .field("without", &FormattedBitSet::<T>::new(&self.without))
+            .finish()
+    }
 }
 
 impl<T: SparseSetIndex> Default for FilteredAccess<T> {
@@ -238,12 +293,9 @@ impl<T: SparseSetIndex> FilteredAccess<T> {
 
     /// Returns `true` if this and `other` can be active at the same time.
     pub fn is_compatible(&self, other: &FilteredAccess<T>) -> bool {
-        if self.access.is_compatible(&other.access) {
-            true
-        } else {
-            self.with.intersection(&other.without).next().is_some()
-                || self.without.intersection(&other.with).next().is_some()
-        }
+        self.access.is_compatible(&other.access)
+            || !self.with.is_disjoint(&other.without)
+            || !other.with.is_disjoint(&self.without)
     }
 
     /// Returns a vector of elements that this and `other` cannot access at the same time.
@@ -282,12 +334,6 @@ impl<T: SparseSetIndex> FilteredAccessSet<T> {
     #[inline]
     pub fn combined_access(&self) -> &Access<T> {
         &self.combined_access
-    }
-
-    /// Returns a mutable reference to the unfiltered access of the entire set.
-    #[inline]
-    pub fn combined_access_mut(&mut self) -> &mut Access<T> {
-        &mut self.combined_access
     }
 
     /// Returns `true` if this and `other` can be active at the same time.
@@ -338,6 +384,20 @@ impl<T: SparseSetIndex> FilteredAccessSet<T> {
         self.filtered_accesses.push(filtered_access);
     }
 
+    /// Adds a read access without filters to the set.
+    pub(crate) fn add_unfiltered_read(&mut self, index: T) {
+        let mut filter = FilteredAccess::default();
+        filter.add_read(index);
+        self.add(filter);
+    }
+
+    /// Adds a write access without filters to the set.
+    pub(crate) fn add_unfiltered_write(&mut self, index: T) {
+        let mut filter = FilteredAccess::default();
+        filter.add_write(index);
+        self.add(filter);
+    }
+
     pub fn extend(&mut self, filtered_access_set: FilteredAccessSet<T>) {
         self.combined_access
             .extend(&filtered_access_set.combined_access);
@@ -362,7 +422,7 @@ impl<T: SparseSetIndex> Default for FilteredAccessSet<T> {
 
 #[cfg(test)]
 mod tests {
-    use crate::query::{Access, FilteredAccess};
+    use crate::query::{Access, FilteredAccess, FilteredAccessSet};
 
     #[test]
     fn access_get_conflicts() {
@@ -389,6 +449,22 @@ mod tests {
         assert_eq!(access_d.get_conflicts(&access_a), vec![]);
         assert_eq!(access_d.get_conflicts(&access_b), vec![]);
         assert_eq!(access_d.get_conflicts(&access_c), vec![0]);
+    }
+
+    #[test]
+    fn filtered_combined_access() {
+        let mut access_a = FilteredAccessSet::<usize>::default();
+        access_a.add_unfiltered_read(1);
+
+        let mut filter_b = FilteredAccess::<usize>::default();
+        filter_b.add_write(1);
+
+        let conflicts = access_a.get_conflicts_single(&filter_b);
+        assert_eq!(
+            &conflicts,
+            &[1_usize],
+            "access_a: {access_a:?}, filter_b: {filter_b:?}"
+        );
     }
 
     #[test]
